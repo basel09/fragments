@@ -9,7 +9,12 @@ import { ChatSettings } from '@/components/chat-settings'
 import { NavBar } from '@/components/navbar'
 import { Preview } from '@/components/preview'
 import { useAuth } from '@/lib/auth'
-import { Message, toAISDKMessages, toMessageImage } from '@/lib/messages'
+import {
+  CodeSelectionData,
+  Message,
+  toAISDKMessages,
+  toMessageImage,
+} from '@/lib/messages'
 import { LLMModelConfig } from '@/lib/models'
 import modelsList from '@/lib/models.json'
 import { FragmentSchema, fragmentSchema as schema } from '@/lib/schema'
@@ -18,9 +23,13 @@ import templates from '@/lib/templates'
 import { ExecutionResult } from '@/lib/types'
 import { DeepPartial } from 'ai'
 import { experimental_useObject as useObject } from 'ai/react'
+import { nanoid } from 'nanoid'
 import { usePostHog } from 'posthog-js/react'
 import { SetStateAction, useEffect, useState } from 'react'
 import { useLocalStorage } from 'usehooks-ts'
+
+const MAX_SELECTION_TOKENS = 800
+const TOKEN_CHAR_RATIO = 4
 
 export default function Home() {
   const [chatInput, setChatInput] = useLocalStorage('chat', '')
@@ -51,6 +60,12 @@ export default function Home() {
     'useMorphApply',
     process.env.NEXT_PUBLIC_USE_MORPH_APPLY === 'true',
   )
+
+  // Code selection state
+  const [codeSelection, setCodeSelection] = useState<CodeSelectionData | null>(
+    null,
+  )
+  const [conversationId] = useState(() => nanoid())
 
   const filteredModels = modelsList.models.filter((model) => {
     if (process.env.NEXT_PUBLIC_HIDE_LOCAL_MODELS) {
@@ -123,6 +138,19 @@ export default function Home() {
         setMessage({ result })
         setCurrentTab('fragment')
         setIsPreviewLoading(false)
+
+        // Save assistant message to MongoDB (non-blocking)
+        saveToMongoDB({
+          conversationId,
+          userId: session?.user?.id || 'anonymous',
+          role: 'assistant',
+          fragment: {
+            code: fragment?.code,
+            template: fragment?.template,
+            title: fragment?.title,
+          },
+          createdAt: new Date().toISOString(),
+        })
       }
     },
   })
@@ -156,6 +184,11 @@ export default function Home() {
     if (error) stop()
   }, [error])
 
+  // Auto-clear stale selection when code changes
+  useEffect(() => {
+    setCodeSelection(null)
+  }, [fragment?.code])
+
   function setMessage(message: Partial<Message>, index?: number) {
     setMessages((previousMessages) => {
       const updatedMessages = [...previousMessages]
@@ -166,6 +199,47 @@ export default function Home() {
 
       return updatedMessages
     })
+  }
+
+  // Strategy 1: Smart truncation (token-based cap)
+  function truncateSelection(
+    selection: CodeSelectionData,
+  ): CodeSelectionData {
+    const estimatedTokens = Math.ceil(selection.code.length / TOKEN_CHAR_RATIO)
+
+    if (estimatedTokens <= MAX_SELECTION_TOKENS) {
+      return selection
+    }
+
+    const maxChars = MAX_SELECTION_TOKENS * TOKEN_CHAR_RATIO
+    const lines = selection.code.split('\n')
+    let charCount = 0
+    let keptLines = 0
+
+    for (const line of lines) {
+      if (charCount + line.length + 1 > maxChars) break
+      charCount += line.length + 1
+      keptLines++
+    }
+
+    const truncatedCode =
+      lines.slice(0, keptLines).join('\n') +
+      `\n// ... truncated (${lines.length - keptLines} lines omitted)`
+
+    return {
+      ...selection,
+      code: truncatedCode,
+      lineRange: {
+        start: selection.lineRange.start,
+        end: selection.lineRange.start + keptLines - 1,
+      },
+      tokenEstimate: Math.ceil(truncatedCode.length / TOKEN_CHAR_RATIO),
+    }
+  }
+
+  function handleAttachSelection(selection: CodeSelectionData) {
+    const truncated = truncateSelection(selection)
+    setCodeSelection(truncated)
   }
 
   async function handleSubmitAuth(e: React.FormEvent<HTMLFormElement>) {
@@ -188,6 +262,39 @@ export default function Home() {
       })
     }
 
+    // Inject code selection into message content
+    if (codeSelection) {
+      // Strategy 4: Duplicate detection
+      const isDuplicate = messages.some((msg) =>
+        msg.content.some(
+          (c) =>
+            c.type === 'codeSelection' &&
+            c.code === codeSelection.code &&
+            c.fileName === codeSelection.fileName,
+        ),
+      )
+
+      if (isDuplicate) {
+        content.push({
+          type: 'codeSelection',
+          code: '[Same code as previously referenced]',
+          fileName: codeSelection.fileName,
+          language: codeSelection.language,
+          lineRange: codeSelection.lineRange,
+          tokenEstimate: 15,
+        })
+      } else {
+        content.push({
+          type: 'codeSelection',
+          code: codeSelection.code,
+          fileName: codeSelection.fileName,
+          language: codeSelection.language,
+          lineRange: codeSelection.lineRange,
+          tokenEstimate: codeSelection.tokenEstimate,
+        })
+      }
+    }
+
     const updatedMessages = addMessage({
       role: 'user',
       content,
@@ -203,13 +310,25 @@ export default function Home() {
       ...(shouldUseMorph && fragment ? { currentFragment: fragment } : {}),
     })
 
+    // Save user message to MongoDB (non-blocking)
+    saveToMongoDB({
+      conversationId,
+      userId: session?.user?.id || 'anonymous',
+      role: 'user',
+      content,
+      model: currentModel.id,
+      createdAt: new Date().toISOString(),
+    })
+
     setChatInput('')
     setFiles([])
+    setCodeSelection(null)
     setCurrentTab('code')
 
     posthog.capture('chat_submit', {
       template: selectedTemplate,
       model: languageModel.model,
+      hasCodeSelection: !!codeSelection,
     })
   }
 
@@ -269,6 +388,7 @@ export default function Home() {
     setResult(undefined)
     setCurrentTab('code')
     setIsPreviewLoading(false)
+    setCodeSelection(null)
   }
 
   function setCurrentPreview(preview: {
@@ -282,6 +402,15 @@ export default function Home() {
   function handleUndo() {
     setMessages((previousMessages) => [...previousMessages.slice(0, -2)])
     setCurrentPreview({ fragment: undefined, result: undefined })
+  }
+
+  // MongoDB persistence helper (non-blocking, graceful degradation)
+  function saveToMongoDB(data: Record<string, unknown>) {
+    fetch('/api/conversations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    }).catch((err) => console.error('MongoDB save failed (non-critical):', err))
   }
 
   return (
@@ -326,6 +455,9 @@ export default function Home() {
             isMultiModal={currentModel?.multiModal || false}
             files={files}
             handleFileChange={handleFileChange}
+            codeSelection={codeSelection}
+            onClearSelection={() => setCodeSelection(null)}
+            messages={messages}
           >
             <ChatPicker
               templates={templates}
@@ -355,6 +487,7 @@ export default function Home() {
           fragment={fragment}
           result={result as ExecutionResult}
           onClose={() => setFragment(undefined)}
+          onAttachSelection={handleAttachSelection}
         />
       </div>
     </main>

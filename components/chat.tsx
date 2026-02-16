@@ -2,7 +2,7 @@ import { Message } from '@/lib/messages'
 import { FragmentSchema } from '@/lib/schema'
 import { ExecutionResult } from '@/lib/types'
 import { DeepPartial } from 'ai'
-import { LoaderIcon, Terminal } from 'lucide-react'
+import { LoaderIcon, Paperclip, Terminal } from 'lucide-react'
 import { useEffect } from 'react'
 
 export function Chat({
@@ -46,6 +46,20 @@ export function Chat({
                   alt="fragment"
                   className="mr-2 inline-block w-12 h-12 object-cover rounded-lg bg-white mb-2"
                 />
+              )
+            }
+            if (content.type === 'codeSelection') {
+              return (
+                <div
+                  key={id}
+                  className="inline-flex items-center gap-1.5 px-2 py-1 rounded-md bg-orange-500/10 text-orange-500 text-xs border border-orange-500/20"
+                >
+                  <Paperclip className="h-3 w-3" />
+                  <span>
+                    {content.fileName} · lines {content.lineRange.start}-
+                    {content.lineRange.end} · ~{content.tokenEstimate} tokens
+                  </span>
+                </div>
               )
             }
           })}

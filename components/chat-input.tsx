@@ -8,8 +8,9 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
+import { CodeSelectionData, Message } from '@/lib/messages'
 import { isFileInArray } from '@/lib/utils'
-import { ArrowUp, Paperclip, Square, X } from 'lucide-react'
+import { ArrowUp, ChevronDown, ChevronUp, Paperclip, Square, X } from 'lucide-react'
 import { SetStateAction, useEffect, useMemo, useState } from 'react'
 import TextareaAutosize from 'react-textarea-autosize'
 
@@ -27,6 +28,9 @@ export function ChatInput({
   files,
   handleFileChange,
   children,
+  codeSelection,
+  onClearSelection,
+  messages,
 }: {
   retry: () => void
   isErrored: boolean
@@ -41,7 +45,12 @@ export function ChatInput({
   files: File[]
   handleFileChange: (change: SetStateAction<File[]>) => void
   children: React.ReactNode
+  codeSelection?: CodeSelectionData | null
+  onClearSelection?: () => void
+  messages?: Message[]
 }) {
+  const [isPreviewExpanded, setIsPreviewExpanded] = useState(false)
+
   function handleFileInput(e: React.ChangeEvent<HTMLInputElement>) {
     handleFileChange((prev) => {
       const newFiles = Array.from(e.target.files || [])
@@ -126,6 +135,14 @@ export function ChatInput({
     })
   }, [files])
 
+  // Strategy 5: Context budget display
+  const estimatedTokens = useMemo(() => {
+    const historyText = JSON.stringify(messages || [])
+    const inputText = input || ''
+    const selectionTokens = codeSelection?.tokenEstimate || 0
+    return Math.ceil((historyText.length + inputText.length) / 4) + selectionTokens
+  }, [messages, input, codeSelection])
+
   function onEnter(e: React.KeyboardEvent<HTMLFormElement>) {
     if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
       e.preventDefault()
@@ -142,6 +159,17 @@ export function ChatInput({
       handleFileChange([])
     }
   }, [isMultiModal])
+
+  // Collapse preview when selection is cleared
+  useEffect(() => {
+    if (!codeSelection) {
+      setIsPreviewExpanded(false)
+    }
+  }, [codeSelection])
+
+  const selectionLineCount = codeSelection
+    ? (codeSelection.code.match(/\n/g) || []).length + 1
+    : 0
 
   return (
     <form
@@ -182,6 +210,42 @@ export function ChatInput({
           }`}
         >
           <div className="flex items-center px-3 py-2 gap-1">{children}</div>
+          {codeSelection && (
+            <div className="px-3 pb-1">
+              <div
+                className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-orange-500/10 border border-orange-500/20 cursor-pointer"
+                onClick={() => setIsPreviewExpanded(!isPreviewExpanded)}
+              >
+                <Paperclip className="h-3.5 w-3.5 text-orange-500 shrink-0" />
+                <span className="text-xs text-orange-500 flex-1 truncate">
+                  {codeSelection.fileName} · lines{' '}
+                  {codeSelection.lineRange.start}-{codeSelection.lineRange.end}{' '}
+                  · {selectionLineCount} lines · ~{codeSelection.tokenEstimate}{' '}
+                  tokens
+                </span>
+                {isPreviewExpanded ? (
+                  <ChevronUp className="h-3 w-3 text-orange-500 shrink-0" />
+                ) : (
+                  <ChevronDown className="h-3 w-3 text-orange-500 shrink-0" />
+                )}
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    onClearSelection?.()
+                  }}
+                  className="text-orange-500 hover:text-orange-600 shrink-0"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </div>
+              {isPreviewExpanded && (
+                <pre className="mt-1 p-2 rounded-lg bg-muted text-xs overflow-auto max-h-[100px] text-muted-foreground">
+                  {codeSelection.code}
+                </pre>
+              )}
+            </div>
+          )}
           <TextareaAutosize
             autoFocus={true}
             minRows={1}
@@ -270,9 +334,16 @@ export function ChatInput({
         </div>
       </div>
       <p className="text-xs text-muted-foreground mt-2 text-center">
-        Fragments is an open-source project made by{' '}
+        Context: ~{estimatedTokens.toLocaleString()} tokens
+        {codeSelection && (
+          <span className="text-orange-500">
+            {' '}
+            (incl. {codeSelection.tokenEstimate} from selection)
+          </span>
+        )}
+        {' · '}
         <a href="https://e2b.dev" target="_blank" className="text-[#ff8800]">
-          ✶ E2B
+          E2B
         </a>
       </p>
     </form>
